@@ -29,6 +29,7 @@ type hole struct {
 	first   uint16
 	last    uint16
 	deleted bool
+	data    buffer.View
 }
 
 type reassembler struct {
@@ -39,7 +40,6 @@ type reassembler struct {
 	mu           sync.Mutex
 	holes        []hole
 	deleted      int
-	heap         fragHeap
 	done         bool
 	creationTime int64
 	pkt          *stack.PacketBuffer
@@ -49,7 +49,6 @@ func newReassembler(id FragmentID, clock tcpip.Clock) *reassembler {
 	r := &reassembler{
 		id:           id,
 		holes:        make([]hole, 0, 16),
-		heap:         make(fragHeap, 0, 8),
 		creationTime: clock.NowMonotonic(),
 	}
 	r.holes = append(r.holes, hole{
@@ -61,23 +60,25 @@ func newReassembler(id FragmentID, clock tcpip.Clock) *reassembler {
 
 // updateHoles updates the list of holes for an incoming fragment and
 // returns true iff the fragment filled at least part of an existing hole.
-func (r *reassembler) updateHoles(first, last uint16, more bool) bool {
-	used := false
+func (r *reassembler) updateHoles(first, last uint16, more bool) (used bool, index int) {
 	for i := range r.holes {
 		if r.holes[i].deleted || first > r.holes[i].last || last < r.holes[i].first {
 			continue
 		}
 		used = true
+		index = i
 		r.deleted++
 		r.holes[i].deleted = true
 		if first > r.holes[i].first {
-			r.holes = append(r.holes, hole{r.holes[i].first, first - 1, false})
+			r.holes = append(r.holes, hole{first: r.holes[i].first, last: first - 1, deleted: false})
+			r.holes[i].first = first
 		}
 		if last < r.holes[i].last && more {
-			r.holes = append(r.holes, hole{last + 1, r.holes[i].last, false})
+			r.holes = append(r.holes, hole{first: last + 1, last: r.holes[i].last, deleted: false})
+			r.holes[i].last = last
 		}
 	}
-	return used
+	return used, index
 }
 
 func (r *reassembler) process(first, last uint16, more bool, proto uint8, pkt *stack.PacketBuffer) (buffer.VectorisedView, uint8, bool, int, error) {
@@ -90,7 +91,7 @@ func (r *reassembler) process(first, last uint16, more bool, proto uint8, pkt *s
 		// was waiting on the mutex. We don't have to do anything in this case.
 		return buffer.VectorisedView{}, 0, false, consumed, nil
 	}
-	if r.updateHoles(first, last, more) {
+	if used, i := r.updateHoles(first, last, more); used {
 		// For IPv6, it is possible to have different Protocol values between
 		// fragments of a packet (because, unlike IPv4, the Protocol is not used to
 		// identify a fragment). In this case, only the Protocol of the first
@@ -103,17 +104,23 @@ func (r *reassembler) process(first, last uint16, more bool, proto uint8, pkt *s
 			r.pkt = pkt
 			r.proto = proto
 		}
-		vv := pkt.Data
 		// We store the incoming packet only if it filled some holes.
-		heap.Push(&r.heap, fragment{offset: first, vv: vv.Clone(nil)})
+		vv := pkt.Data
 		consumed = vv.Size()
+		r.holes[i].data = vv.ToOwnedView()
 		r.size += consumed
 	}
 	// Check if all the holes have been deleted and we are ready to reassamble.
 	if r.deleted < len(r.holes) {
 		return buffer.VectorisedView{}, 0, false, consumed, nil
 	}
-	res, err := r.heap.reassemble()
+
+	nfrag := len(r.holes)
+	h := make(fragHeap, 0, nfrag)
+	for i := 0; i < nfrag; i++ {
+		heap.Push(&h, fragment{offset: r.holes[i].first, vv: r.holes[i].data.ToVectorisedView()})
+	}
+	res, err := h.reassemble()
 	if err != nil {
 		return buffer.VectorisedView{}, 0, false, consumed, fmt.Errorf("fragment reassembly failed: %w", err)
 	}
