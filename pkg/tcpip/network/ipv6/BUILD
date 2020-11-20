@@ -8,6 +8,7 @@ go_library(
         "dhcpv6configurationfromndpra_string.go",
         "icmp.go",
         "ipv6.go",
+        "mld.go",
         "ndp.go",
     ],
     visibility = ["//visibility:public"],
